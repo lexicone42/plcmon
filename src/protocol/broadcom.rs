@@ -122,6 +122,44 @@ pub fn parse_nw_stats_cnf(data: &[u8]) -> Option<(MacAddr, Vec<BcmLinkRate>)> {
     Some((src, rates))
 }
 
+/// Parse BCM NW_INFO.CNF — returns responder MAC and raw payload for inspection.
+pub fn parse_nw_info_cnf(data: &[u8]) -> Option<(MacAddr, Vec<u8>)> {
+    let (_dst, src, etype, eth_off) = parse_eth(data)?;
+    if etype != ETHERTYPE_MEDIAXTREAM {
+        return None;
+    }
+    let (mmtype, _seq, payload_off) = parse_bcm_hdr(data, eth_off)?;
+    if mmtype != BCM_NW_INFO_CNF {
+        return None;
+    }
+    Some((src, data[payload_off..].to_vec()))
+}
+
+/// Extract MAC addresses found in a raw NW_INFO payload by scanning for
+/// 6-byte sequences that look like unicast, non-zero MACs.
+pub fn extract_macs_from_payload(payload: &[u8]) -> Vec<MacAddr> {
+    let mut macs = Vec::new();
+    if payload.len() < 6 {
+        return macs;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..=payload.len() - 6 {
+        let bytes = &payload[i..i + 6];
+        if bytes == [0; 6] || bytes == [0xFF; 6] {
+            continue;
+        }
+        if bytes[0] & 1 != 0 {
+            continue; // multicast
+        }
+        if let Some(mac) = MacAddr::from_bytes(bytes) {
+            if seen.insert(mac) {
+                macs.push(mac);
+            }
+        }
+    }
+    macs
+}
+
 /// Parse BCM STA_INFO.CNF — chip/firmware metadata.
 pub fn parse_sta_info_cnf(data: &[u8]) -> Option<BcmStationInfo> {
     let (_dst, _src, etype, eth_off) = parse_eth(data)?;

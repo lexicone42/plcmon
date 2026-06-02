@@ -38,6 +38,13 @@ enum Cmd {
         #[arg(short, long)]
         interface: Option<String>,
     },
+    /// Deep diagnostics for a specific adapter (when it's not showing up)
+    Probe {
+        /// MAC address of adapter to probe
+        mac: String,
+        #[arg(short, long)]
+        interface: Option<String>,
+    },
     /// Set up BPF permissions for non-root capture (macOS)
     Setup,
 }
@@ -51,6 +58,7 @@ fn main() {
         } => cmd_monitor(interface.as_deref(), interval),
         Cmd::Scan { interface, json } => cmd_scan(interface.as_deref(), json),
         Cmd::Restart { mac, interface } => cmd_restart(interface.as_deref(), &mac),
+        Cmd::Probe { mac, interface } => cmd_probe(interface.as_deref(), &mac),
         Cmd::Setup => plcmon::setup::run_setup(),
     }
 }
@@ -183,6 +191,200 @@ fn cmd_restart(iface: Option<&str>, mac_str: &str) {
         Ok(result) => print_scan(&result),
         Err(e) => eprintln!("Re-scan error: {e}"),
     }
+}
+
+fn cmd_probe(iface: Option<&str>, mac_str: &str) {
+    let target = parse_mac_arg(mac_str);
+
+    println!("Probing {target}...\n");
+
+    // Step 1: Normal scan to establish context
+    println!("  [1/5] Network scan...");
+    let cap = match PlcCapture::open(iface) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let iface_str = cap.iface.clone();
+    let host_mac = cap.mac;
+    let mut scanner = Scanner::new(cap);
+    let scan_result = match scanner.scan() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Scan error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let found_in_scan = scan_result.devices.iter().any(|d| d.mac == target);
+    let has_link = scan_result
+        .links
+        .iter()
+        .any(|l| l.from == target || l.to == target);
+    let local_mac = scan_result
+        .devices
+        .iter()
+        .find(|d| d.is_local)
+        .map(|d| d.mac);
+    let online_remotes: Vec<_> = scan_result
+        .devices
+        .iter()
+        .filter(|d| !d.is_local && d.mac != target)
+        .map(|d| d.mac)
+        .collect();
+
+    if found_in_scan {
+        println!("        Found in scan (has link: {has_link})");
+    } else {
+        println!("        NOT found in scan");
+    }
+    println!(
+        "        Online devices: {} (+ local)",
+        scan_result.devices.len() - 1
+    );
+
+    // Step 2: BCM NW_INFO from local adapter
+    drop(scanner);
+    let mut cap = match PlcCapture::open(Some(&iface_str)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error reopening capture: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Some(local) = local_mac {
+        println!("\n  [2/5] BCM NW_INFO from local adapter ({})...", local.short());
+        let frame = plcmon::protocol::broadcom::build_nw_info_req(local, host_mac, 1);
+        let _ = cap.send(&frame);
+        let mut nw_info_macs = Vec::new();
+        let _ = cap.recv_until(Duration::from_secs(3), |data| {
+            if let Some((_src, payload)) =
+                plcmon::protocol::broadcom::parse_nw_info_cnf(data)
+            {
+                nw_info_macs =
+                    plcmon::protocol::broadcom::extract_macs_from_payload(&payload);
+                println!("        Response: {} bytes, {} MAC candidates in payload",
+                    payload.len(), nw_info_macs.len());
+                let target_found = nw_info_macs.iter().any(|m| *m == target);
+                if target_found {
+                    println!("        ** Target {target} FOUND in NW_INFO **");
+                } else {
+                    println!("        Target NOT in NW_INFO topology");
+                }
+                for m in &nw_info_macs {
+                    let marker = if *m == target { " <-- TARGET" } else { "" };
+                    println!("          - {m}{marker}");
+                }
+                return false;
+            }
+            true
+        });
+        if nw_info_macs.is_empty() {
+            println!("        No NW_INFO response (may not be supported)");
+        }
+    }
+
+    // Step 3: NW_INFO from each online remote
+    println!("\n  [3/5] Querying other online adapters...");
+    for remote in &online_remotes {
+        let frame = plcmon::protocol::broadcom::build_nw_info_req(*remote, host_mac, 2);
+        let _ = cap.send(&frame);
+        let mut found = false;
+        let _ = cap.recv_until(Duration::from_secs(2), |data| {
+            if let Some((_src, payload)) =
+                plcmon::protocol::broadcom::parse_nw_info_cnf(data)
+            {
+                let macs =
+                    plcmon::protocol::broadcom::extract_macs_from_payload(&payload);
+                let target_found = macs.iter().any(|m| *m == target);
+                println!("        {} — {} stations, target: {}",
+                    remote.short(),
+                    macs.len(),
+                    if target_found { "FOUND" } else { "not found" }
+                );
+                found = true;
+                return false;
+            }
+            true
+        });
+        if !found {
+            println!("        {} — no response", remote.short());
+        }
+    }
+
+    // Step 4: Direct unicast probe to target
+    println!("\n  [4/5] Direct probe to {target}...");
+    let frame = plcmon::protocol::broadcom::build_sta_info_req(target, host_mac, 3);
+    let _ = cap.send(&frame);
+    let mut direct_response = false;
+    let _ = cap.recv_until(Duration::from_secs(3), |data| {
+        if let Some(info) = plcmon::protocol::broadcom::parse_sta_info_cnf(data) {
+            println!("        ** RESPONDED ** — chip: 0x{:08X}, uptime: {}s",
+                info.chip_version, info.uptime_secs);
+            direct_response = true;
+            return false;
+        }
+        if let Some((_dst, src, etype, _)) = plcmon::protocol::parse_eth(data) {
+            if src == target {
+                println!("        Got frame from target (etype: {:02X}{:02X})", etype[0], etype[1]);
+                direct_response = true;
+                return false;
+            }
+        }
+        true
+    });
+    if !direct_response {
+        println!("        No response — adapter unreachable");
+    }
+
+    // Step 5: Passive listen
+    println!("\n  [5/5] Passive listen for frames from {target} (5s)...");
+    let mut frame_count = 0u32;
+    let _ = cap.recv_until(Duration::from_secs(5), |data| {
+        if let Some((_dst, src, _, _)) = plcmon::protocol::parse_eth(data) {
+            if src == target {
+                frame_count += 1;
+                if frame_count == 1 {
+                    println!("        ** Receiving frames! **");
+                }
+            }
+        }
+        true // keep listening
+    });
+    if frame_count > 0 {
+        println!("        Captured {frame_count} frames from target");
+    } else {
+        println!("        No frames received — adapter silent on network");
+    }
+
+    // Summary
+    println!("\n  ━━━ Diagnosis ━━━");
+    if direct_response || frame_count > 0 {
+        println!("  Adapter is reachable but not linking properly.");
+        println!("  Try: cargo run -- restart {target}");
+    } else if found_in_scan {
+        println!("  Adapter appears in topology but isn't responding.");
+        println!("  Try power-cycling it and re-pairing.");
+    } else {
+        println!("  Adapter is completely unreachable.");
+        println!("  Possible causes:");
+        println!("    - Powerline PHY hardware failure");
+        println!("    - Lost network key (re-pair: press pair on working adapter,");
+        println!("      then on this adapter within 2 minutes)");
+        println!("    - Electrical isolation (different circuit breaker panel,");
+        println!("      GFCI outlet, or surge protector blocking signal)");
+        println!("    - Adapter plugged into power strip (must be direct wall outlet)");
+        println!();
+        println!("  Next steps:");
+        println!("    1. Verify powerline LED (middle) is lit — if not, no PLC link");
+        println!("    2. Move adapter next to a working one and try again");
+        println!("    3. Factory reset: hold pair button 10+ seconds until LEDs flash");
+        println!("       then re-pair with the network");
+    }
+    println!();
 }
 
 fn parse_mac_arg(s: &str) -> plcmon::protocol::MacAddr {
