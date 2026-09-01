@@ -45,6 +45,27 @@ enum Cmd {
         #[arg(short, long)]
         interface: Option<String>,
     },
+    /// Health check: scan, detect degraded links, optionally restart adapters
+    Check {
+        #[arg(short, long)]
+        interface: Option<String>,
+        /// Minimum acceptable average speed in Mbps (default: 50)
+        #[arg(long, default_value = "50")]
+        min_speed: u16,
+        /// Automatically restart degraded adapters
+        #[arg(long)]
+        restart: bool,
+        /// Base cooldown between restarts of the same adapter, in minutes.
+        /// Doubles after each restart that fails to recover the link (max 24h).
+        #[arg(long, default_value = "60")]
+        cooldown_mins: u64,
+        /// State file for restart backoff tracking
+        #[arg(long, default_value = "/var/lib/plcmon/check-state.json")]
+        state_file: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Set up BPF permissions for non-root capture (macOS)
     Setup,
 }
@@ -59,6 +80,21 @@ fn main() {
         Cmd::Scan { interface, json } => cmd_scan(interface.as_deref(), json),
         Cmd::Restart { mac, interface } => cmd_restart(interface.as_deref(), &mac),
         Cmd::Probe { mac, interface } => cmd_probe(interface.as_deref(), &mac),
+        Cmd::Check {
+            interface,
+            min_speed,
+            restart,
+            cooldown_mins,
+            state_file,
+            json,
+        } => cmd_check(
+            interface.as_deref(),
+            min_speed,
+            restart,
+            cooldown_mins,
+            &state_file,
+            json,
+        ),
         Cmd::Setup => plcmon::setup::run_setup(),
     }
 }
@@ -485,6 +521,344 @@ fn print_scan(scan: &plcmon::types::NetworkScan) {
         }
     }
     println!();
+}
+
+// -- Health check ----------------------------------------------------------
+
+/// Exit codes for the check subcommand (cron/init-script friendly)
+const EXIT_HEALTHY: i32 = 0;
+const EXIT_ERROR: i32 = 1;
+const EXIT_DEGRADED: i32 = 2;
+
+#[derive(serde::Serialize)]
+struct CheckResult {
+    healthy: bool,
+    restarted: Vec<String>,
+    in_backoff: Vec<String>,
+    degraded: Vec<DegradedLink>,
+    scan: plcmon::types::NetworkScan,
+}
+
+#[derive(serde::Serialize)]
+struct DegradedLink {
+    from: String,
+    to: String,
+    avg_mbps: u16,
+    tx_signal: String,
+    reason: String,
+}
+
+/// Per-adapter restart tracking, persisted between check runs so we don't
+/// restart-loop an adapter whose link never recovers (physical-layer problem).
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct CheckState {
+    #[serde(default)]
+    adapters: std::collections::HashMap<String, AdapterState>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy)]
+struct AdapterState {
+    /// Unix epoch seconds of the last restart we sent
+    last_restart_epoch: i64,
+    /// Restarts sent without the link ever returning to healthy
+    consecutive_failures: u32,
+}
+
+const MAX_COOLDOWN_MINS: u64 = 24 * 60;
+
+fn load_check_state(path: &str) -> CheckState {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_check_state(path: &str, state: &CheckState) {
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match serde_json::to_string_pretty(state) {
+        Ok(s) => {
+            if let Err(e) = std::fs::write(path, s) {
+                eprintln!("WARN: could not persist restart state to {path}: {e}");
+                eprintln!("      (restart backoff will not work across runs)");
+            }
+        }
+        Err(e) => eprintln!("WARN: could not serialize restart state: {e}"),
+    }
+}
+
+/// Cooldown for an adapter: base after the first failed restart, doubling for
+/// each further failure (1h, 2h, 4h, ...), capped at 24h.
+fn cooldown_secs(base_mins: u64, failures: u32) -> i64 {
+    let mult = 1u64 << failures.saturating_sub(1).min(10);
+    let mins = (base_mins.saturating_mul(mult)).min(MAX_COOLDOWN_MINS);
+    (mins * 60) as i64
+}
+
+fn ts() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn cmd_check(
+    iface: Option<&str>,
+    min_speed: u16,
+    do_restart: bool,
+    cooldown_mins: u64,
+    state_file: &str,
+    json: bool,
+) {
+    let cap = match PlcCapture::open(iface) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(EXIT_ERROR);
+        }
+    };
+
+    let iface_name = cap.iface.clone();
+    let mut scanner = Scanner::new(cap);
+    let scan = match scanner.scan() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Scan error: {e}");
+            std::process::exit(EXIT_ERROR);
+        }
+    };
+
+    if scan.devices.is_empty() {
+        if json {
+            println!(r#"{{"healthy":false,"error":"no devices found","restarted":[],"degraded":[]}}"#);
+        } else {
+            eprintln!("No powerline devices found on {iface_name}");
+        }
+        std::process::exit(EXIT_ERROR);
+    }
+
+    // Find degraded links
+    let mut degraded = Vec::new();
+    for link in &scan.links {
+        let avg = ((link.tx_mbps as u32 + link.rx_mbps as u32) / 2) as u16;
+        let is_siso = matches!(
+            link.tx_signal.as_str(),
+            "SISO" | "SISO2" | "SisoOnly"
+        );
+
+        let reason = if avg == 0 {
+            Some("no link".to_string())
+        } else if avg < min_speed && is_siso {
+            Some(format!("SISO fallback at {avg} Mbps (min: {min_speed})"))
+        } else if avg < min_speed {
+            Some(format!("{avg} Mbps below minimum {min_speed}"))
+        } else if is_siso && avg < min_speed * 2 {
+            // SISO with moderate speed — could recover MIMO with restart
+            Some(format!("SISO mode at {avg} Mbps — MIMO restart may help"))
+        } else {
+            None
+        };
+
+        if let Some(reason) = reason {
+            degraded.push(DegradedLink {
+                from: link.from.to_string(),
+                to: link.to.to_string(),
+                avg_mbps: avg,
+                tx_signal: link.tx_signal.clone(),
+                reason,
+            });
+        }
+    }
+
+    let healthy = degraded.is_empty();
+
+    // Restart degraded remote adapters if requested (with backoff)
+    let mut restarted = Vec::new();
+    let mut in_backoff: Vec<String> = Vec::new();
+    let mut state = load_check_state(state_file);
+    let now_epoch = chrono::Local::now().timestamp();
+
+    // Any adapter that is no longer degraded gets its failure history cleared.
+    {
+        let degraded_macs: std::collections::HashSet<String> = degraded
+            .iter()
+            .flat_map(|d| [d.from.clone(), d.to.clone()])
+            .collect();
+        state.adapters.retain(|mac, _| degraded_macs.contains(mac));
+    }
+
+    if do_restart && !degraded.is_empty() {
+        // Collect unique remote MACs to restart (skip local adapter)
+        let local_macs: std::collections::HashSet<_> = scan
+            .devices
+            .iter()
+            .filter(|d| d.is_local)
+            .map(|d| d.mac)
+            .collect();
+
+        let mut restart_candidates = std::collections::HashSet::new();
+        for d in &degraded {
+            // Parse the "to" MAC — restart the remote end of degraded links
+            if let Some(mac) = plcmon::net::parse_mac(&d.to) {
+                if !local_macs.contains(&mac) {
+                    restart_candidates.insert(mac);
+                }
+            }
+            if let Some(mac) = plcmon::net::parse_mac(&d.from) {
+                if !local_macs.contains(&mac) {
+                    restart_candidates.insert(mac);
+                }
+            }
+        }
+
+        // Apply backoff: skip adapters whose previous restart didn't stick.
+        // Every restart disrupts devices behind the adapter, so an adapter
+        // that stays degraded earns exponentially longer cooldowns.
+        let mut restart_targets = Vec::new();
+        for mac in restart_candidates {
+            let key = mac.to_string();
+            match state.adapters.get(&key) {
+                Some(st) => {
+                    let cd = cooldown_secs(cooldown_mins, st.consecutive_failures);
+                    let elapsed = now_epoch - st.last_restart_epoch;
+                    if elapsed < cd {
+                        let next_in_mins = (cd - elapsed) / 60;
+                        if !json {
+                            eprintln!(
+                                "[{}] {key} still degraded after {} restart(s) — in backoff, next attempt in ~{next_in_mins}m",
+                                ts(),
+                                st.consecutive_failures
+                            );
+                        }
+                        in_backoff.push(key);
+                    } else {
+                        restart_targets.push(mac);
+                    }
+                }
+                None => restart_targets.push(mac),
+            }
+        }
+
+        if !json && !restart_targets.is_empty() {
+            eprintln!(
+                "[{}] Found {} degraded link(s), restarting {} adapter(s)...",
+                ts(),
+                degraded.len(),
+                restart_targets.len()
+            );
+        }
+
+        // Reopen capture for sending restart frames (only if something to do)
+        if !restart_targets.is_empty() {
+        let mut cap2 = match PlcCapture::open(Some(&iface_name)) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Could not reopen capture for restart: {e}");
+                std::process::exit(EXIT_ERROR);
+            }
+        };
+
+        for target in &restart_targets {
+            let frame =
+                plcmon::protocol::broadcom::build_sta_restart_req(*target, cap2.mac, 0);
+            if let Err(e) = cap2.send(&frame) {
+                if !json {
+                    eprintln!("Failed to restart {target}: {e}");
+                }
+                continue;
+            }
+
+            // Wait briefly for ack
+            let mut acked = false;
+            let _ = cap2.recv_until(Duration::from_secs(3), |data| {
+                if let Some((_dst, _src, etype, eth_off)) =
+                    plcmon::protocol::parse_eth(data)
+                    && etype == plcmon::protocol::ETHERTYPE_MEDIAXTREAM
+                    && let Some((mmtype, _seq, _off)) =
+                        plcmon::protocol::parse_bcm_hdr(data, eth_off)
+                    && mmtype == plcmon::protocol::broadcom::BCM_STA_RESTART_CNF
+                {
+                    acked = true;
+                    return false;
+                }
+                true
+            });
+
+            if !json {
+                if acked {
+                    eprintln!("  Restarted {target} (acknowledged)");
+                } else {
+                    eprintln!("  Restarted {target} (no ack — may have rebooted immediately)");
+                }
+            }
+            restarted.push(target.to_string());
+
+            // Record the restart so the next run applies backoff if it didn't help
+            let entry = state
+                .adapters
+                .entry(target.to_string())
+                .or_insert(AdapterState {
+                    last_restart_epoch: now_epoch,
+                    consecutive_failures: 0,
+                });
+            entry.last_restart_epoch = now_epoch;
+            entry.consecutive_failures += 1;
+        }
+        } // if !restart_targets.is_empty()
+    }
+
+    save_check_state(state_file, &state);
+
+    // Output
+    if json {
+        let result = CheckResult {
+            healthy,
+            restarted,
+            in_backoff,
+            degraded,
+            scan,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).expect("json serialize")
+        );
+    } else if healthy {
+        println!("[{}] OK — all links above {min_speed} Mbps", ts());
+        for link in &scan.links {
+            let avg = ((link.tx_mbps as u32 + link.rx_mbps as u32) / 2) as u16;
+            let sig = if link.tx_signal.is_empty() {
+                ""
+            } else {
+                &link.tx_signal
+            };
+            println!(
+                "  {} → {}  {avg} Mbps avg  {sig}",
+                link.from.short(),
+                link.to.short()
+            );
+        }
+    } else {
+        println!(
+            "[{}] DEGRADED — {} link(s) below threshold",
+            ts(),
+            degraded.len()
+        );
+        for d in &degraded {
+            println!("  {} → {}  {} Mbps  {}", d.from, d.to, d.avg_mbps, d.reason);
+        }
+        if !restarted.is_empty() {
+            println!("Restarted: {}", restarted.join(", "));
+        }
+        if !in_backoff.is_empty() {
+            println!(
+                "In backoff (restart withheld — repeated restarts haven't helped): {}",
+                in_backoff.join(", ")
+            );
+        }
+        if do_restart && restarted.is_empty() && in_backoff.is_empty() {
+            println!("No remote adapters to restart.");
+        }
+    }
+
+    std::process::exit(if healthy { EXIT_HEALTHY } else { EXIT_DEGRADED });
 }
 
 fn assess_link(tx: u16, rx: u16, _signal: &str) -> &'static str {

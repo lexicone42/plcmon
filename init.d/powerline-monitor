@@ -1,0 +1,50 @@
+#!/sbin/openrc-run
+# OpenRC init script for powerline-monitor
+# This runs as a simple periodic service using crond
+#
+# Install: sudo cp init.d/powerline-monitor /etc/init.d/ && sudo chmod +x /etc/init.d/powerline-monitor
+# Setup:   sudo plcmon setup   (grants cap_net_raw for non-root capture)
+#
+# Exit codes from plcmon check:
+#   0 = all links healthy
+#   1 = error (no devices, capture failure)
+#   2 = degraded links found (restarted if --restart)
+
+description="Powerline AP Health Monitor"
+command="/usr/local/bin/plcmon"
+
+# Minimum link speed before triggering restart (Mbps)
+: ${PLCMON_MIN_SPEED:=50}
+# Network interface (empty = auto-detect)
+: ${PLCMON_IFACE:=}
+
+# This service doesn't run as a daemon - it's triggered by cron
+# This init script is for manual runs and status checks
+
+depend() {
+    need net
+    after logger
+}
+
+start() {
+    local iface_arg=""
+    [ -n "${PLCMON_IFACE}" ] && iface_arg="--interface ${PLCMON_IFACE}"
+
+    ebegin "Running powerline health check"
+    ${command} check --restart --min-speed ${PLCMON_MIN_SPEED} ${iface_arg}
+    eend $?
+}
+
+stop() {
+    # Nothing to stop - this is a one-shot check
+    return 0
+}
+
+status() {
+    local iface_arg=""
+    [ -n "${PLCMON_IFACE}" ] && iface_arg="--interface ${PLCMON_IFACE}"
+
+    ebegin "Powerline device status"
+    ${command} scan ${iface_arg}
+    eend $?
+}
